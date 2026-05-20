@@ -1,0 +1,2 @@
+stored graphs: 225604
+time = 56.81s

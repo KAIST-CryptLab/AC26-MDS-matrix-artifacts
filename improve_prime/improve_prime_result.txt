@@ -1,0 +1,92 @@
+# Improving prime coefficient result
+
+sampling graph_index uniformly from 1..8
+best attempt=5 max_entry=52 sum_entry=197 max_det=156 graph_index=7
+best attempt=7 max_entry=8 sum_entry=72 max_det=52 graph_index=7
+best attempt=180 max_entry=8 sum_entry=58 max_det=28 graph_index=1
+best attempt=250 max_entry=6 sum_entry=45 max_det=46 graph_index=7
+best attempt=1769 max_entry=6 sum_entry=41 max_det=24 graph_index=3
+best attempt=1823 max_entry=6 sum_entry=34 max_det=23 graph_index=4
+best attempt=2463 max_entry=5 sum_entry=41 max_det=19 graph_index=7
+best attempt=3868 max_entry=5 sum_entry=40 max_det=23 graph_index=7
+best attempt=10359 max_entry=5 sum_entry=37 max_det=27 graph_index=7
+best attempt=15727 max_entry=5 sum_entry=35 max_det=17 graph_index=7
+best attempt=17560 max_entry=5 sum_entry=32 max_det=19 graph_index=7
+best attempt=20044 max_entry=4 sum_entry=34 max_det=12 graph_index=3
+matrix:
+  [ 2 1 1 3]
+  [ 1 2 3 1]
+  [ 3 1 2 4]
+  [ 1 3 4 2]
+graph_index=3
+coeffs=[(1, 1), (1, 1), (1, 1), (1, 1), (2, 1), (1, 2), (1, 1), (1, 1)]
+sampling graph_index uniformly from 1..330
+best attempt=209 max_entry=80 sum_entry=676 max_det=320 graph_index=37
+best attempt=748 max_entry=62 sum_entry=485 max_det=416 graph_index=228
+best attempt=1297 max_entry=52 sum_entry=400 max_det=512 graph_index=108
+best attempt=1309 max_entry=20 sum_entry=224 max_det=552 graph_index=85
+best attempt=2187 max_entry=18 sum_entry=167 max_det=164 graph_index=77
+best attempt=17099 max_entry=18 sum_entry=167 max_det=68 graph_index=264
+best attempt=60641 max_entry=16 sum_entry=167 max_det=512 graph_index=35
+best attempt=63527 max_entry=15 sum_entry=174 max_det=51 graph_index=113
+best attempt=269631 max_entry=11 sum_entry=144 max_det=90 graph_index=110
+best attempt=1634679 max_entry=10 sum_entry=127 max_det=88 graph_index=40
+best attempt=2005443 max_entry=10 sum_entry=114 max_det=34 graph_index=87
+best attempt=2846560 max_entry=8 sum_entry=98 max_det=40 graph_index=78
+matrix:
+  [ 4 6 5 5 3]
+  [ 2 6 4 8 5]
+  [ 3 5 3 4 2]
+  [ 1 5 4 6 4]
+  [ 4 4 3 1 1]
+graph_index=78
+coeffs=[(1, 1), (1, 1), (1, 2), (1, 1), (2, 2), (2, 1), (1, 1), (1, 1), (1, 2), (1, 1), (1, 1), (2, 1)]
+sampling graph_index uniformly from 1..2147
+best attempt=19100 max_entry=49 sum_entry=801 max_det=532 graph_index=2109
+matrix:
+  [ 1 14 16 12 13 19]
+  [ 5 38 40 40 36 49]
+  [ 8 36 37 44 38 46]
+  [ 1 5 7 4 5 8]
+  [ 2 17 17 18 16 21]
+  [ 8 32 33 40 34 41]
+graph_index=2109
+coeffs=[(2, 2), (1, 2), (1, 1), (1, 1), (1, 2), (1, 1), (1, 2), (2, 2), (1, 1), (1, 2), (1, 1), (1, 2), (1, 1), (1, 1), (1, 1), (2, 1)]
+sampling graph_index uniformly from 1..2
+best attempt=7314 max_entry=35932 sum_entry=232408 max_det=3403804 graph_index=2
+best attempt=10280 max_entry=4563 sum_entry=29354 max_det=1417500 graph_index=1
+best attempt=62927 max_entry=2172 sum_entry=17629 max_det=1103904 graph_index=2
+best attempt=212731 max_entry=1665 sum_entry=18031 max_det=183696 graph_index=2
+best attempt=240985 max_entry=744 sum_entry=9913 max_det=126134 graph_index=2
+best attempt=866865 max_entry=737 sum_entry=6722 max_det=1140048 graph_index=1
+best attempt=1474075 max_entry=538 sum_entry=9220 max_det=411264 graph_index=2
+best attempt=2336307 max_entry=514 sum_entry=6201 max_det=62216 graph_index=2
+best attempt=7955749 max_entry=510 sum_entry=7035 max_det=569916 graph_index=1
+best attempt=9689267 max_entry=256 sum_entry=3328 max_det=76524 graph_index=1
+matrix:
+  [ 6 92 21 24 20 80 26]
+  [ 10 104 30 18 25 96 29]
+  [ 26 256 82 38 62 240 70]
+  [ 16 189 50 44 43 168 53]
+  [ 15 157 47 29 37 146 43]
+  [ 12 121 38 20 29 114 35]
+  [ 18 187 56 41 43 170 52]
+graph_index=1
+coeffs=[(1, 2), (2, 2), (1, 1), (1, 2), (3, 2), (1, 1), (1, 3), (1, 1), (2, 1), (2, 2), (1, 1), (1, 2), (1, 1), (1, 2), (3, 1), (2, 1), (2, 2), (3, 1), (1, 1), (1, 2), (1, 3)]
+
+sampling graph_index uniformly from 1..2
+best attempt=78368 max_entry=11246 sum_entry=130164 max_det=3612768 graph_index=2
+best attempt=551831 max_entry=5774 sum_entry=46303 max_det=92827008 graph_index=2
+best attempt=4086606 max_entry=2461 sum_entry=31150 max_det=10340244 graph_index=1
+best attempt=5489009 max_entry=644 sum_entry=10273 max_det=13208832 graph_index=2
+matrix:
+  [ 12 4 3 5 3 8 6 3]
+  [ 36 11 12 26 16 12 20 18]
+  [ 116 46 69 109 77 24 68 71]
+  [ 170 66 75 120 99 74 97 78]
+  [ 378 158 195 320 235 124 221 202]
+  [ 332 148 195 319 221 75 197 201]
+  [ 644 284 372 623 424 150 384 387]
+  [ 388 168 214 355 248 107 229 221]
+graph_index=2
+coeffs=[(1, 1), (2, 1), (1, 1), (2, 1), (3, 2), (1, 2), (3, 1), (2, 1), (2, 1), (1, 2), (2, 1), (3, 2), (1, 1), (3, 1), (1, 2), (2, 1), (3, 1), (1, 1), (2, 1), (2, 1), (2, 3), (3, 1), (2, 1), (1, 3), (2, 1), (1, 1)]
