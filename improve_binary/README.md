@@ -32,6 +32,34 @@ in `improve_binary_result.txt`, i.e. the entries above the line
 `### Further optimization using MILP (only reduced case) ###` having the
 minimum XOR count for each `(t,k)`.
 
+The bit-level XOR post-optimization experiments are implemented in
+`xor_post_optimization.py`: the `(5,4)` coefficient search over
+`SC(5,5,12)`, the `(6,8)` exact joint/direct bit-level rewrite, the `(7,8)`
+exact local SLPs for the coefficient maps, and the larger-word sparse-`L`
+circuit generation.  The starting candidates are the relevant entries from
+`improve_binary_result.txt` and are written directly in the script.  The
+`(6,8)` mode also reconstructs the recorded `148 -> 147 -> 146 -> 145 -> 144`
+cost reduction before printing the final count.  The
+`(5,4)` search may take a long time when the full graph space is enabled.
+
+This script can also be read as a reproducible reference for the
+post-optimization step.  Given an already MDS-valid word-level construction,
+the same ideas can be reused by replacing the hard-coded constraints,
+coefficients, and sparse linear map with another candidate, then searching for
+cheaper local SLPs or direct bit-level rewrites.
+
+For example:
+
+```sh
+python3 xor_post_optimization.py --run t5-k4 --fixed-graph 220
+python3 xor_post_optimization.py --run t6-k8
+python3 xor_post_optimization.py --run t7-k8
+python3 xor_post_optimization.py --run larger-k
+```
+
+To run the full version of the `(5,4)` search over all stored graphs, omit
+`--fixed-graph`.
+
 The examples below assume your current directory is `improve_binary/`.
 
 ## Basic Commands
@@ -70,6 +98,14 @@ The examples below assume your current directory is `improve_binary/`.
 
 ```sh
 ./improve_binary --t 6 --k 8 --base-k 8 --base-poly 0x187 --adaptive-sum-filter
+```
+
+- Rerun selected bit-level XOR post-optimization experiments:
+
+```sh
+python3 xor_post_optimization.py --run t6-k8
+python3 xor_post_optimization.py --run t7-k8
+python3 xor_post_optimization.py --run larger-k
 ```
 
 - Manual stage-1 coefficients:
@@ -168,3 +204,6 @@ The examples below assume your current directory is `improve_binary/`.
 - `BASE`: graph base cost, equal to `number_of_gates * k`.
 
 - `EXTRA`: multiplier cost from the chosen powers of `L`.
+
+- `xor_post_optimization.py` reports the final post-optimized totals and the
+  savings against the best pre-post-optimization candidates.
