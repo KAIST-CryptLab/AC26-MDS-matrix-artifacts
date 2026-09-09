@@ -10,21 +10,19 @@ binary-field constructions:
 3. apply a joint/direct bit-level rewrite for a selected word-level node;
 4. build sparse-L circuits for larger word sizes.
 
-The file is organized so that the optimization can be audited from the code:
-the starting graph, exponents, and sparse linear map are written explicitly,
-and each experiment rebuilds the improved XOR circuit before reporting its
-gate count.  The output lines are formatted to match the corresponding
-post-optimization block in improve_binary_result.txt.
-
-Use --run to execute a selected experiment.  Some modes are intentionally
-long-running because they encode the original search space rather than a
-shortened demo.
+The search modes do not assume the final answer: they sample coefficient
+assignments or sparse linear maps, synthesize local/joint/direct XOR circuits,
+test the MDS condition, and report a new best candidate whenever one is found.
+Thus repeated long runs may report candidates different from, or better than,
+the records in improve_binary_result.txt.
 """
 
 from __future__ import annotations
 
 import argparse
-from collections import deque
+import random
+import time
+from collections import Counter, deque
 from dataclasses import dataclass
 from itertools import combinations
 from pathlib import Path
@@ -36,6 +34,10 @@ Supports = tuple[tuple[int, ...], ...]
 
 AUDIT_PREVIOUS_TOTALS = {
     (5, 4): 55,
+    (5, 8): 103,
+    (5, 16): 197,
+    (5, 32): 389,
+    (5, 64): 773,
     (6, 8): 148,
     (6, 16): 267,
     (6, 32): 522,
@@ -46,21 +48,14 @@ AUDIT_PREVIOUS_TOTALS = {
     (7, 64): 1363,
 }
 
-# These values are audit guards copied from improve_binary_result.txt.  They
-# never determine the reported count; each experiment first rebuilds a circuit
-# and then checks that len(circuit.gates) still matches this record.
-AUDIT_EXPECTED_TOTALS = {
-    (6, 8): 144,
-    (6, 16): 265,
-    (6, 32): 521,
-    (6, 64): 1033,
-    (7, 8): 212,
-    (7, 16): 370,
-    (7, 32): 689,
-    (7, 64): 1361,
+# For the fixed 16-node t=6,k=8 DAG and the seven exponent slots used below,
+# symbolic-minor analysis in the original search showed that MDS candidates can
+# only occur for these characteristic polynomials.  Search modes use this as a
+# speed filter by default, but it can be disabled from the command line.
+T6_K8_ALLOWED_CHARPOLYS = {
+    283, 301, 333, 351, 355, 357, 375, 379, 391, 395, 397, 419, 433, 445,
+    451, 463, 471, 477, 487, 501,
 }
-
-AUDIT_T6_K8_STAGE_COSTS = (147, 146, 145, 144)
 
 
 def format_coeffs(coeffs: Iterable[Coeff]) -> str:
@@ -140,6 +135,406 @@ def matrix_power(matrix: tuple[int, ...], exponent: int) -> tuple[int, ...]:
     return result
 
 
+def matrix_add(left: tuple[int, ...], right: tuple[int, ...]) -> tuple[int, ...]:
+    return tuple(a ^ b for a, b in zip(left, right))
+
+
+def rank_binary(rows: Iterable[int]) -> int:
+    basis: dict[int, int] = {}
+    for original in rows:
+        row = original
+        while row:
+            pivot = row.bit_length() - 1
+            if pivot in basis:
+                row ^= basis[pivot]
+            else:
+                basis[pivot] = row
+                break
+    return len(basis)
+
+
+def block_matrix_to_packed_rows(blocks: list[list[tuple[int, ...]]], k: int) -> list[int]:
+    t = len(blocks)
+    return [
+        sum(blocks[block_row][block_column][bit_row] << (k * block_column)
+            for block_column in range(t))
+        for block_row in range(t)
+        for bit_row in range(k)
+    ]
+
+
+def minor_specs(t: int):
+    return [
+        (size, row_words, column_words)
+        for size in range(1, t + 1)
+        for row_words in combinations(range(t), size)
+        for column_words in combinations(range(t), size)
+    ]
+
+
+def packed_minor_rows(matrix_rows: list[int], k: int, row_words, column_words) -> list[int]:
+    rows_out = []
+    for block_row in row_words:
+        for bit_row in range(k):
+            source = matrix_rows[k * block_row + bit_row]
+            packed = 0
+            for local, block_column in enumerate(column_words):
+                packed |= ((source >> (k * block_column)) & ((1 << k) - 1)) << (k * local)
+            rows_out.append(packed)
+    return rows_out
+
+
+def blocks_invertible_packed(matrix_rows: list[int], t: int, k: int) -> bool:
+    for block_row in range(t):
+        for block_column in range(t):
+            block = [
+                (matrix_rows[k * block_row + bit] >> (k * block_column)) & ((1 << k) - 1)
+                for bit in range(k)
+            ]
+            if rank_binary(block) != k:
+                return False
+    return True
+
+
+def full_mds_packed(matrix_rows: list[int], t: int, k: int) -> bool:
+    for size, row_words, column_words in minor_specs(t):
+        if rank_binary(packed_minor_rows(matrix_rows, k, row_words, column_words)) != k * size:
+            return False
+    return True
+
+
+def closure_path(required: frozenset[int], k: int) -> tuple[tuple[int, int, int], ...] | None:
+    available = set(identity_rows(k))
+    remaining = set(required) - available
+    path: list[tuple[int, int, int]] = []
+    while remaining:
+        made = None
+        forms = list(available)
+        for ai, left in enumerate(forms):
+            for right in forms[ai + 1:]:
+                candidate = left ^ right
+                if candidate in remaining:
+                    made = (left, right, candidate)
+                    break
+            if made is not None:
+                break
+        if made is None:
+            return None
+        path.append(made)
+        available.add(made[2])
+        remaining.remove(made[2])
+    return tuple(path)
+
+
+def synth_at_most(target_rows: tuple[int, ...], k: int, limit: int) -> tuple[tuple[int, int, int], ...] | None:
+    targets = frozenset(target_rows)
+    inputs = set(identity_rows(k))
+    noninputs = targets - inputs
+    minimum = len(noninputs)
+    if minimum > limit:
+        return None
+    universe = [value for value in range(1, 1 << k) if value not in inputs | targets]
+    for cost in range(minimum, limit + 1):
+        for extras in combinations(universe, cost - minimum):
+            path = closure_path(frozenset(noninputs | set(extras)), k)
+            if path is not None and targets <= inputs | {result for _left, _right, result in path}:
+                return path
+    return None
+
+
+def randomized_paar(ninputs: int, targets: list[int], seed: int, window: int = 4):
+    """Randomized common-subexpression synthesis for linear XOR targets."""
+
+    rng = random.Random(seed)
+    expressions = [{bit for bit in range(ninputs) if (target >> bit) & 1} for target in targets]
+    forms = [1 << bit for bit in range(ninputs)]
+    lookup = {form: wire for wire, form in enumerate(forms)}
+    gates: list[tuple[int, int]] = []
+
+    while True:
+        counts: Counter[tuple[int, int]] = Counter()
+        for expression in expressions:
+            terms = list(expression)
+            for i, left in enumerate(terms):
+                for right in terms[:i]:
+                    counts[(min(left, right), max(left, right))] += 1
+        if not counts:
+            break
+        best = max(counts.values())
+        if best < 2:
+            break
+        choices = [
+            (pair, count)
+            for pair, count in counts.items()
+            if count >= max(2, best - window + 1)
+        ]
+        (left, right), _count = rng.choices(
+            choices, weights=[(count - 1) ** 3 for _pair, count in choices], k=1
+        )[0]
+        form = forms[left] ^ forms[right]
+        output = lookup.get(form)
+        if output is None:
+            output = len(forms)
+            forms.append(form)
+            lookup[form] = output
+            gates.append((left, right))
+        for expression in expressions:
+            if left in expression and right in expression:
+                expression ^= {left, right, output}
+
+    outputs = [-1] * len(expressions)
+    order = list(range(len(expressions)))
+    rng.shuffle(order)
+    for row in order:
+        terms = list(expressions[row])
+        rng.shuffle(terms)
+        while len(terms) > 1:
+            reusable = None
+            for i, left in enumerate(terms):
+                for j in range(i):
+                    right = terms[j]
+                    form = forms[left] ^ forms[right]
+                    if form in lookup:
+                        reusable = i, j, lookup[form]
+                        break
+                if reusable is not None:
+                    break
+            if reusable is None:
+                left = terms.pop()
+                right = terms.pop()
+                form = forms[left] ^ forms[right]
+                output = lookup.get(form)
+                if output is None:
+                    output = len(forms)
+                    forms.append(form)
+                    lookup[form] = output
+                    gates.append((left, right))
+            else:
+                i, j, output = reusable
+                for index in sorted((i, j), reverse=True):
+                    terms.pop(index)
+            terms.append(output)
+        outputs[row] = terms[0]
+
+    if [forms[wire] for wire in outputs] != targets:
+        raise AssertionError("Paar synthesis produced wrong target forms")
+    return tuple(gates), tuple(outputs)
+
+
+def best_randomized_paar(
+    ninputs: int,
+    targets: list[int],
+    *,
+    seeds: int,
+    seed_base: int,
+    window: int,
+) -> tuple[tuple[tuple[int, int], ...], tuple[int, ...]]:
+    best = None
+    for offset in range(seeds):
+        candidate = randomized_paar(ninputs, targets, seed_base + offset, window=window)
+        if best is None or len(candidate[0]) < len(best[0]):
+            best = candidate
+    if best is None:
+        raise ValueError("at least one Paar seed is required")
+    return best
+
+
+def legacy_paar(target_rows: tuple[int, ...], seed: int):
+    """Paar-style local synthesis used by the original scalar-record searches."""
+
+    rng = random.Random(seed)
+    k = len(target_rows)
+    signals = [1 << bit for bit in range(k)]
+    expressions = [
+        {index for index, signal in enumerate(signals) if row & signal}
+        for row in target_rows
+    ]
+    gates: list[tuple[int, int]] = []
+
+    while True:
+        counts: dict[tuple[int, int], int] = {}
+        for expression in expressions:
+            for left, right in combinations(sorted(expression), 2):
+                counts[left, right] = counts.get((left, right), 0) + 1
+        best = max(counts.values(), default=1)
+        if best < 2:
+            break
+        left, right = rng.choice([pair for pair, count in counts.items() if count == best])
+        output = len(signals)
+        signals.append(signals[left] ^ signals[right])
+        gates.append((left, right))
+        for expression in expressions:
+            if left in expression and right in expression:
+                expression.remove(left)
+                expression.remove(right)
+                expression.add(output)
+
+    known = {form: wire for wire, form in enumerate(signals)}
+    outputs = []
+    for expression in expressions:
+        wires = list(expression)
+        while len(wires) > 1:
+            left = wires.pop()
+            right = wires.pop()
+            form = signals[left] ^ signals[right]
+            output = known.get(form)
+            if output is None:
+                output = len(signals)
+                signals.append(form)
+                known[form] = output
+                gates.append((left, right))
+            wires.append(output)
+        outputs.append(wires[0])
+
+    if [signals[wire] for wire in outputs] != list(target_rows):
+        raise AssertionError("legacy Paar synthesis produced wrong target forms")
+    return tuple(gates), tuple(outputs)
+
+
+def best_legacy_paar(
+    target_rows: tuple[int, ...],
+    *,
+    seeds: int,
+    seed_base: int = 0,
+) -> tuple[tuple[tuple[int, int], ...], tuple[int, ...]]:
+    best = None
+    for offset in range(seeds):
+        candidate = legacy_paar(target_rows, seed_base + offset)
+        if best is None or len(candidate[0]) < len(best[0]):
+            best = candidate
+    if best is None:
+        raise ValueError("at least one Paar seed is required")
+    return best
+
+
+def charpoly8(matrix: tuple[int, ...]) -> int:
+    """Characteristic polynomial of an 8x8 binary matrix, encoded as a bitset."""
+
+    dp = {0: 1}
+    for row in range(8):
+        next_dp: dict[int, int] = {}
+        for mask, value in dp.items():
+            for column in range(8):
+                if (mask >> column) & 1:
+                    continue
+                entry = (matrix[row] >> column) & 1
+                if row == column:
+                    product = value << 1
+                    if entry:
+                        product ^= value
+                elif entry:
+                    product = value
+                else:
+                    continue
+                new_mask = mask | (1 << column)
+                next_dp[new_mask] = next_dp.get(new_mask, 0) ^ product
+        dp = next_dp
+    return dp.get(255, 0)
+
+
+def rank_k(rows_in: tuple[int, ...], k: int) -> int:
+    return rank_binary(row & ((1 << k) - 1) for row in rows_in)
+
+
+def random_cost2_general(rng: random.Random, k: int = 8):
+    """Sample an invertible map implementable by a permutation plus two XORs."""
+
+    if k != 8:
+        raise ValueError("the changed-L search currently samples k=8 maps")
+    first_left, first_right = rng.sample(range(k), 2)
+    forms = list(identity_rows(k))
+    forms.append(forms[first_left] ^ forms[first_right])
+    while True:
+        second_left, second_right = rng.sample(range(k + 1), 2)
+        second = forms[second_left] ^ forms[second_right]
+        if second and second not in forms:
+            break
+    forms.append(second)
+    for _ in range(20):
+        chosen = rng.sample(range(k + 1), k - 1) + [k + 1]
+        row_values = [forms[index] for index in chosen]
+        if rank_k(tuple(row_values), k) == k:
+            rng.shuffle(row_values)
+            return tuple(row_values), ((first_left, first_right), (second_left, second_right))
+    return None
+
+
+def constraints_with_slot_exponents(constraints, slot_exponents: Iterable[int]):
+    exponent_iterator = iter(slot_exponents)
+    output = []
+    for destination, terms in constraints:
+        changed_terms = []
+        for source, exponent in terms:
+            changed_terms.append((source, next(exponent_iterator) if exponent else 0))
+        output.append((destination, tuple(changed_terms)))
+    try:
+        next(exponent_iterator)
+    except StopIteration:
+        return output
+    raise ValueError("too many slot exponents")
+
+
+def constraints_to_coeffs(constraints) -> tuple[Coeff, ...]:
+    return tuple((int(terms[0][1]), int(terms[1][1])) for _destination, terms in constraints)
+
+
+def matrix_rows_to_supports(matrix: tuple[int, ...]) -> Supports:
+    return tuple(
+        tuple(column + 1 for column in range(len(matrix)) if (row >> column) & 1)
+        for row in matrix
+    )
+
+
+def transfer_blocks_from_constraints(t: int, l_matrix: tuple[int, ...], constraints) -> list[list[tuple[int, ...]]]:
+    k = len(l_matrix)
+    powers: dict[int, tuple[int, ...]] = {0: identity_rows(k)}
+
+    def power(exponent: int) -> tuple[int, ...]:
+        if exponent not in powers:
+            powers[exponent] = matrix_power(l_matrix, exponent)
+        return powers[exponent]
+
+    zero = tuple(0 for _ in range(k))
+    one = identity_rows(k)
+    values = {
+        f"x{row + 1}": [one if row == column else zero for column in range(t)]
+        for row in range(t)
+    }
+    for destination, terms in constraints:
+        result = [zero] * t
+        for source, exponent in terms:
+            coefficient = power(exponent)
+            result = [
+                matrix_add(old, matrix_multiply(coefficient, value))
+                for old, value in zip(result, values[source])
+            ]
+        values[destination] = result
+    return [values[f"y{row + 1}"] for row in range(t)]
+
+
+def constraints_are_mds(t: int, l_matrix: tuple[int, ...], constraints) -> bool:
+    k = len(l_matrix)
+    packed = block_matrix_to_packed_rows(transfer_blocks_from_constraints(t, l_matrix, constraints), k)
+    return full_mds_packed(packed, t, k)
+
+
+def exponent_tuples_by_weight(slot_count: int, budget: int) -> Iterator[tuple[int, ...]]:
+    domain = range(-budget, budget + 1)
+
+    def visit(slot: int, remaining: int, current: list[int]) -> Iterator[tuple[int, ...]]:
+        if slot == slot_count:
+            yield tuple(current)
+            return
+        for exponent in domain:
+            cost = abs(exponent)
+            if cost <= remaining:
+                current.append(exponent)
+                yield from visit(slot + 1, remaining - cost, current)
+                current.pop()
+
+    yield from visit(0, budget, [])
+
+
 @dataclass(frozen=True)
 class Result:
     """A final post-optimization record, formatted like improve_binary_result."""
@@ -172,16 +567,6 @@ class Result:
             f"tot={self.total}({self.base_xor}+{self.extra_xor}) "
             f"coeffs={format_coeffs(self.coeffs)} L={format_l(self.l_rows)}"
         )
-
-
-def audited_total(t: int, k: int, circuit: "Circuit") -> int:
-    total_xor = len(circuit.gates)
-    expected = AUDIT_EXPECTED_TOTALS.get((t, k))
-    if expected is not None and total_xor != expected:
-        raise AssertionError(
-            f"computed {total_xor} gates for ({t},{k}), expected audit record {expected}"
-        )
-    return total_xor
 
 
 # ---------------------------------------------------------------------------
@@ -433,247 +818,7 @@ def run_t5_k4_search(graph_root: Path, *, max_cost: int, fixed_graph: int | None
 
 
 # ---------------------------------------------------------------------------
-# SLP synthesis and direct rewrite experiments.
-# ---------------------------------------------------------------------------
-
-
-class Circuit:
-    def __init__(self, input_count: int, *, reuse_equal_forms: bool = False) -> None:
-        self.forms = [1 << bit for bit in range(input_count)]
-        self.gates: list[list[int]] = []
-        self.by_form = {form: wire for wire, form in enumerate(self.forms)} if reuse_equal_forms else None
-
-    def emit(self, left: int, right: int) -> int:
-        if left == right:
-            raise ValueError("self-XOR is not a valid gate")
-        form = self.forms[left] ^ self.forms[right]
-        if self.by_form is not None and form in self.by_form:
-            return self.by_form[form]
-        output = len(self.forms)
-        self.forms.append(form)
-        self.gates.append([left, right])
-        if self.by_form is not None:
-            self.by_form[form] = output
-        return output
-
-    def word_xor(self, left: list[int], right: list[int]) -> list[int]:
-        if len(left) != len(right):
-            raise ValueError("word widths differ")
-        return [self.emit(a, b) for a, b in zip(left, right)]
-
-
-def apply_local_path(circuit: Circuit, word: list[int], path: Iterable[tuple[int, int, int]]) -> dict[int, int]:
-    local = {1 << bit: word[bit] for bit in range(len(word))}
-    for left_form, right_form, result_form in path:
-        local[result_form] = circuit.emit(local[left_form], local[right_form])
-    return local
-
-
-def run_t7_k8_lm4_synthesis() -> Result:
-    l_rows = rows((8,), (1, 2), (2, 8), (3,), (4,), (5,), (6,), (7,))
-    l_matrix = support_rows_to_masks(l_rows)
-
-    # Local SLPs copied from the post-optimization experiment.  They implement
-    # selected powers of the fixed k=8 map more cheaply than repeated L calls.
-    local_power_slps = {
-        -4: {
-            "gates": [(0, 2), (4, 8), (1, 3), (10, 8), (11, 5), (9, 5), (1, 8)],
-            "outputs": [12, 13, 6, 7, 0, 14, 10, 9],
-        },
-        -2: {
-            "gates": [(1, 2), (0, 8), (3, 1), (3, 9)],
-            "outputs": [10, 11, 4, 5, 6, 7, 0, 9],
-        },
-        -1: {
-            "gates": [(0, 2), (1, 8)],
-            "outputs": [9, 8, 3, 4, 5, 6, 7, 0],
-        },
-        1: {
-            "gates": [(1, 0), (7, 1)],
-            "outputs": [7, 8, 9, 2, 3, 4, 5, 6],
-        },
-        2: {
-            "gates": [(1, 7), (8, 0), (6, 1), (10, 0)],
-            "outputs": [6, 9, 11, 8, 2, 3, 4, 5],
-        },
-        5: {
-            "gates": [
-                (1, 7), (0, 8), (5, 9), (6, 10), (11, 4),
-                (11, 3), (9, 6), (14, 4), (6, 1), (16, 0),
-            ],
-            "outputs": [3, 12, 13, 15, 10, 17, 8, 2],
-        },
-    }
-    for exponent, slp in local_power_slps.items():
-        forms = list(identity_rows(8))
-        for left, right in slp["gates"]:
-            forms.append(forms[left] ^ forms[right])
-        computed = tuple(forms[index] for index in slp["outputs"])
-        if computed != matrix_power(l_matrix, exponent):
-            raise AssertionError(f"local SLP for L^{exponent} does not match L-power")
-
-    constraints = [
-        ("w1",  [("x2", 0),  ("x4", 0)]),
-        ("w2",  [("x6", 0),  ("x7", 0)]),
-        ("w3",  [("w2", -4), ("x5", 0)]),
-        ("w4",  [("x2", 0),  ("w3", 0)]),
-        ("w5",  [("x3", 0),  ("w4", -1)]),
-        ("w6",  [("x1", 0),  ("w5", -1)]),
-        ("w7",  [("x4", 0),  ("w6", -2)]),
-        ("w8",  [("w6", 0),  ("x7", 0)]),
-        ("w9",  [("w1", 0),  ("w8", 0)]),
-        ("w10", [("w9", 5),  ("w4", 1)]),
-        ("w11", [("w7", 0),  ("w10", 0)]),
-        ("y1",  [("w10", 0), ("w5", 0)]),
-        ("y2",  [("w11", 0), ("w2", 0)]),
-        ("w12", [("y2", 0),  ("x3", 0)]),
-        ("w13", [("w12", 0), ("w1", 0)]),
-        ("y3",  [("w7", -4), ("w12", 0)]),
-        ("w14", [("w13", -1), ("x5", 0)]),
-        ("y4",  [("w10", 1), ("w13", 0)]),
-        ("y5",  [("w11", 2), ("w14", -1)]),
-        ("y6",  [("w14", 0), ("w8", 0)]),
-        ("y7",  [("y5", 0),  ("w9", 0)]),
-    ]
-
-    circuit = Circuit(7 * 8)
-    words = {f"x{word + 1}": list(range(8 * word, 8 * (word + 1))) for word in range(7)}
-
-    def apply_power(source_word: list[int], exponent: int) -> list[int]:
-        if exponent == 0:
-            return source_word[:]
-        slp = local_power_slps[exponent]
-        local = list(source_word)
-        for left, right in slp["gates"]:
-            local.append(circuit.emit(local[left], local[right]))
-        return [local[index] for index in slp["outputs"]]
-
-    for destination, terms in constraints:
-        left = apply_power(words[terms[0][0]], terms[0][1])
-        right = apply_power(words[terms[1][0]], terms[1][1])
-        words[destination] = circuit.word_xor(left, right)
-
-    total_xor = audited_total(7, 8, circuit)
-    base_xor = len(constraints) * 8
-    local_slp_cost = sum(
-        len(local_power_slps[exponent]["gates"])
-        for _destination, terms in constraints
-        for _source, exponent in terms
-        if exponent != 0
-    )
-    if total_xor != base_xor + local_slp_cost:
-        raise AssertionError("t7-k8 local SLP cost decomposition changed")
-
-    coeffs = (
-        (0, 0), (0, 0), (-4, 0), (0, 0), (0, -1), (0, -1), (0, -2),
-        (0, 0), (0, 0), (5, 1), (0, 0), (0, 0), (0, 0), (-1, 0),
-        (0, 0), (0, 0), (-4, 0), (1, 0), (2, -1), (0, 0), (0, 0),
-    )
-    return Result(
-        t=7,
-        k=8,
-        graph_index=2,
-        previous_total=AUDIT_PREVIOUS_TOTALS[(7, 8)],
-        total_xor=total_xor,
-        base_xor=base_xor,
-        coeffs=coeffs,
-        l_rows=l_rows,
-        method="exact local SLPs from the post-optimization experiment",
-    )
-
-
-def run_t6_k8_direct_rewrite() -> Result:
-    k = 8
-    l_rows = rows((3,), (6,), (5,), (4, 5), (4, 7), (1,), (8,), (2,))
-    l = support_rows_to_masks(l_rows)
-    l_inverse = matrix_power(l, -1)
-    l_inverse_square = matrix_power(l, -2)
-
-    # These local paths encode the recorded 148 -> 147 -> 146 -> 145 stages.
-    # The final stage replaces the whole w10 computation by a direct bit-level
-    # circuit, so its cost is counted from the explicit gates below.
-    path_l = ((64, 8, 72), (8, 16, 24))
-    path_l_inverse = ((4, 8, 12), (12, 16, 28))
-    path_l_inverse_square = ((1, 8, 9), (4, 8, 12), (1, 12, 13), (12, 16, 28))
-    path_joint = ((1, 8, 9), (64, 8, 72), (4, 9, 13), (8, 16, 24), (4, 24, 28))
-    w10_gates = (
-        (10, 11), (3, 8), (17, 6), (14, 5), (4, 13), (15, 0), (11, 7),
-        (22, 8), (4, 17), (24, 16), (2, 9), (16, 1), (27, 12),
-    )
-    w10_outputs = (26, 19, 20, 25, 18, 21, 23, 28)
-
-    constraints = [
-        ("w1", (("x1", 0), ("x4", 0))), ("w2", (("x2", 0), ("x6", 0))),
-        ("w3", (("x5", 0), ("w2", 0))), ("w4", (("w1", 0), ("w3", 1))),
-        ("w5", (("x6", 0), ("w4", 0))), ("w6", (("x3", 0), ("w5", 0))),
-        ("w7", (("x4", 0), ("w6", -2))), ("y5", (("w3", 0), ("w6", 1))),
-        ("w8", (("x5", 0), ("w7", -1))), ("w9", (("x3", 0), ("w8", -1))),
-        ("y1", (("w4", 0), ("w8", 0))), ("w10", (("w1", 1), ("w9", -2))),
-        ("y2", (("w9", 0), ("y5", 0))), ("y3", (("w7", 0), ("w10", 0))),
-        ("y6", (("w2", 0), ("w10", 0))), ("y4", (("w5", 0), ("y6", 0))),
-    ]
-
-    circuit = Circuit(6 * k, reuse_equal_forms=True)
-    words = {f"x{index + 1}": list(range(k * index, k * (index + 1))) for index in range(6)}
-
-    def linear(exponent: int, word: list[int], *, joint: bool = False) -> list[int]:
-        if exponent == 0:
-            return word[:]
-        row_map = {1: l, -1: l_inverse, -2: l_inverse_square}[exponent]
-        path = path_joint if joint else {1: path_l, -1: path_l_inverse, -2: path_l_inverse_square}[exponent]
-        local = apply_local_path(circuit, word, path)
-        return [local[row] for row in row_map]
-
-    def direct_w10(left_word: list[int], right_word: list[int]) -> list[int]:
-        local = list(left_word) + list(right_word)
-        for left, right in w10_gates:
-            if left >= len(local) or right >= len(local):
-                raise ValueError("non-topological w10 direct rewrite")
-            local.append(circuit.emit(local[left], local[right]))
-        return [local[index] for index in w10_outputs]
-
-    for destination, ((left_name, left_exp), (right_name, right_exp)) in constraints:
-        if destination == "w10":
-            words[destination] = direct_w10(words[left_name], words[right_name])
-            continue
-        left = linear(left_exp, words[left_name])
-        right = linear(right_exp, words[right_name], joint=(destination == "w7"))
-        words[destination] = circuit.word_xor(left, right)
-
-    total_xor = audited_total(6, 8, circuit)
-    ordinary_word_xor_slots = sum(1 for destination, _terms in constraints if destination != "w10")
-    base_xor = ordinary_word_xor_slots * k
-
-    # Guard the provenance of the staged reduction: if any local path changes,
-    # these assertions force the reported 144-gate result to be recomputed.
-    stage_147 = 16 * k + 6 * 2 + 7
-    stage_146 = 16 * k + 3 * 2 + 2 * 2 + 2 * 4
-    stage_145 = 16 * k + 5 + 2 * 2 + 2 * 2 + 4
-    stage_144 = base_xor + len(path_l) + len(path_joint) + 2 * len(path_l_inverse) + len(w10_gates)
-    if (stage_147, stage_146, stage_145, stage_144) != AUDIT_T6_K8_STAGE_COSTS:
-        raise AssertionError("t6-k8 post-optimization stage costs changed")
-    if stage_144 != total_xor:
-        raise AssertionError("t6-k8 direct circuit count and stage-cost formula differ")
-
-    coeffs = (
-        (0, 0), (0, 0), (0, 0), (0, 1), (0, 0), (0, 0), (0, -2), (0, -1),
-        (0, -1), (1, -2), (0, 0), (0, 0), (0, 0), (0, 0), (0, 1), (0, 0),
-    )
-    return Result(
-        t=6,
-        k=8,
-        graph_index=570,
-        previous_total=AUDIT_PREVIOUS_TOTALS[(6, 8)],
-        total_xor=total_xor,
-        base_xor=base_xor,
-        coeffs=coeffs,
-        l_rows=l_rows,
-        method="148->147->146->145->144 coefficient/local-SLP/joint/direct rewrites",
-    )
-
-
-# ---------------------------------------------------------------------------
-# Sparse-L and exponent-slot rewrite experiments for k=16,32,64.
+# Sparse-L and exponent-slot search data for k=16,32,64.
 # ---------------------------------------------------------------------------
 
 
@@ -688,181 +833,809 @@ T7_REWRITE_COEFFS = (
     (0, 0), (0, 0), (0, 1), (0, -3), (0, 1), (0, 0), (0, 0),
 )
 
-
-def run_t6_large_k_rewrite(k: int) -> Result:
-    """Rebuild the t=6 larger-k circuit using the optimized sparse L choice."""
-
-    taps = {16: 1, 32: 21, 64: 21}
-    if k not in taps:
-        raise ValueError("t=6 larger-k rewrite is defined for k=16,32,64")
-
-    constraints = [
-        ("w1",  (("x1", 0),  ("x4", 0))),
-        ("w2",  (("x2", 0),  ("x6", 0))),
-        ("w3",  (("x5", 0),  ("w2", 0))),
-        ("w4",  (("w1", 0),  ("w3", 1))),
-        ("w5",  (("x6", 0),  ("w4", 0))),
-        ("w6",  (("x3", 0),  ("w5", 0))),
-        ("w7",  (("x4", 0),  ("w6", -2))),
-        ("y5",  (("w3", 0),  ("w6", 1))),
-        ("w8",  (("x5", 0),  ("w7", -1))),
-        ("w9",  (("x3", 0),  ("w8", -1))),
-        ("y1",  (("w4", 0),  ("w8", 0))),
-        ("w10", (("w1", 1),  ("w9", -2))),
-        ("y2",  (("w9", 0),  ("y5", 0))),
-        ("y3",  (("w7", 0),  ("w10", 0))),
-        ("y6",  (("w2", 0),  ("w10", 0))),
-        ("y4",  (("w5", 0),  ("y6", 0))),
-    ]
-
-    tap = taps[k]
-    circuit = Circuit(6 * k)
-    words = {f"x{index + 1}": list(range(index * k, (index + 1) * k)) for index in range(6)}
-
-    # For these companion-style maps, one L or L^{-1} application costs one XOR.
-    # The circuit is still built explicitly, rather than using only the formula.
-    def multiply_l(word: list[int]) -> list[int]:
-        feedback = circuit.emit(word[tap - 1], word[k - 1])
-        return [feedback, *word[:-1]]
-
-    def multiply_l_inverse(word: list[int]) -> list[int]:
-        feedback = circuit.emit(word[0], word[tap])
-        return [*word[1:], feedback]
-
-    def linear(exponent: int, word: list[int]) -> list[int]:
-        result = word[:]
-        inverse = exponent < 0
-        for _ in range(abs(exponent)):
-            result = multiply_l_inverse(result) if inverse else multiply_l(result)
-        return result
-
-    for destination, ((left_name, left_exp), (right_name, right_exp)) in constraints:
-        left = linear(left_exp, words[left_name])
-        right = linear(right_exp, words[right_name])
-        words[destination] = circuit.word_xor(left, right)
-
-    total_xor = audited_total(6, k, circuit)
-    base_xor = len(constraints) * k
-
-    l_rows = companion_rows(k, (tap, k))
-    return Result(
-        t=6,
-        k=k,
-        graph_index=570,
-        previous_total=AUDIT_PREVIOUS_TOTALS[(6, k)],
-        total_xor=total_xor,
-        base_xor=base_xor,
-        coeffs=T6_REWRITE_COEFFS,
-        l_rows=l_rows,
-        method="exact sparse-L circuit generation from the post-optimization experiment",
-    )
+T7_K8_RESULT_COEFFS = (
+    (0, 0), (0, 0), (-4, 0), (0, 0), (0, -1), (0, -1), (0, -2),
+    (0, 0), (0, 0), (5, 1), (0, 0), (0, 0), (0, 0), (-1, 0),
+    (0, 0), (0, 0), (-4, 0), (1, 0), (2, -1), (0, 0), (0, 0),
+)
 
 
-def run_t7_large_k_rewrite(k: int) -> Result:
-    """Rebuild the t=7 larger-k circuit using the optimized sparse L choice."""
+T5_K4_8_BASE_CONSTRAINTS = [
+    ("w1",  (("x2", 0),  ("x5", 0))),
+    ("w2",  (("x4", 0),  ("w1", 0))),
+    ("w3",  (("x3", -1), ("w2", 0))),
+    ("w4",  (("x1", 0),  ("w3", 0))),
+    ("w5",  (("x3", 0),  ("w4", -2))),
+    ("y4",  (("w1", -1), ("w4", 0))),
+    ("w6",  (("x5", 0),  ("w5", 0))),
+    ("y1",  (("x4", 0),  ("w6", 0))),
+    ("y5",  (("w3", 0),  ("w6", -2))),
+    ("w7",  (("y4", 0),  ("y5", 0))),
+    ("y2",  (("w2", 1),  ("w7", 0))),
+    ("y3",  (("w5", 0),  ("w7", 0))),
+]
 
-    taps = {32: 21, 64: 21}
-    if k not in (16, 32, 64):
-        raise ValueError("t=7 larger-k rewrite is defined for k=16,32,64")
+T5_LARGE_BASE_CONSTRAINTS = [
+    ("w1",  (("x2", 0),  ("x5", 0))),
+    ("w2",  (("x3", 0),  ("w1", -1))),
+    ("w3",  (("x4", 0),  ("w1", 0))),
+    ("w4",  (("x1", 0),  ("w3", 0))),
+    ("y4",  (("w2", 0),  ("w4", 0))),
+    ("w5",  (("w3", 1),  ("y4", 0))),
+    ("w6",  (("x5", 0),  ("w5", 1))),
+    ("w7",  (("x3", 0),  ("w6", 1))),
+    ("y1",  (("w2", 0),  ("w6", 0))),
+    ("y2",  (("x4", 0),  ("w7", 0))),
+    ("y5",  (("w4", -1), ("w7", 0))),
+    ("y3",  (("w5", 0),  ("y5", 0))),
+]
 
-    constraints = [
-        ("w1",  (("x2", 0),  ("x4", 0))),
-        ("w2",  (("x2", 0),  ("x6", -1))),
-        ("w3",  (("x5", 0),  ("x7", 0))),
-        ("w4",  (("w3", -1), ("w2", 0))),
-        ("w5",  (("x3", 0),  ("w4", -1))),
-        ("w6",  (("x1", 0),  ("w5", 0))),
-        ("w7",  (("x4", 0),  ("w6", -2))),
-        ("w8",  (("w6", 0),  ("x7", 0))),
-        ("w9",  (("w1", 0),  ("w8", 0))),
-        ("w10", (("w9", 2),  ("w4", 0))),
-        ("w11", (("w7", -2), ("w10", 0))),
-        ("y1",  (("w10", 0), ("w5", 0))),
-        ("y2",  (("w11", 0), ("w3", 0))),
-        ("w12", (("y2", 0),  ("x3", 0))),
-        ("w13", (("w12", 0), ("w1", -2))),
-        ("y3",  (("w7", 0),  ("w12", 1))),
-        ("w14", (("w13", 0), ("x6", 1))),
-        ("y4",  (("w10", 0), ("w13", -3))),
-        ("y5",  (("w11", 0), ("w14", 1))),
-        ("y6",  (("w14", 0), ("w8", 0))),
-        ("y7",  (("y5", 0),  ("w9", 0))),
-    ]
 
-    circuit = Circuit(7 * k)
-    words = {f"x{index + 1}": list(range(index * k, (index + 1) * k)) for index in range(7)}
+T6_K8_OLD_L_ROWS = rows((8,), (1, 2), (2, 8), (3,), (4,), (5,), (6,), (7,))
 
-    # The k=16 map has two XORs per L/L^{-1} application; for k=32,64 the
-    # companion-style map below has one XOR per application.
-    def multiply_l16(word: list[int]) -> list[int]:
-        first = circuit.emit(word[12], word[15])
-        twelfth = circuit.emit(word[8], word[10])
-        return [first, *word[0:10], twelfth, *word[11:15]]
+T6_K8_REWRITE_CONSTRAINTS = [
+    ("w1",  (("x1", 0),  ("x4", 0))),
+    ("w2",  (("x2", 0),  ("x6", 0))),
+    ("w3",  (("x5", 0),  ("w2", 0))),
+    ("w4",  (("w1", 0),  ("w3", 1))),
+    ("w5",  (("x6", 0),  ("w4", 0))),
+    ("w6",  (("x3", 0),  ("w5", 0))),
+    ("w7",  (("x4", 0),  ("w6", -2))),
+    ("y5",  (("w3", 0),  ("w6", 1))),
+    ("w8",  (("x5", 0),  ("w7", -1))),
+    ("w9",  (("x3", 0),  ("w8", -1))),
+    ("y1",  (("w4", 0),  ("w8", 0))),
+    ("w10", (("w1", 1),  ("w9", -2))),
+    ("y2",  (("w9", 0),  ("y5", 0))),
+    ("y3",  (("w7", 0),  ("w10", 0))),
+    ("y6",  (("w2", 0),  ("w10", 0))),
+    ("y4",  (("w5", 0),  ("y6", 0))),
+]
 
-    def multiply_l16_inverse(word: list[int]) -> list[int]:
-        eleventh = circuit.emit(word[11], word[9])
-        sixteenth = circuit.emit(word[0], word[13])
-        return [*word[1:11], eleventh, *word[12:16], sixteenth]
+T6_K8_SLOT_LAYOUT = (
+    (3, 1),
+    (6, 1),
+    (7, 1),
+    (8, 1),
+    (9, 1),
+    (11, 0),
+    (11, 1),
+)
 
-    def multiply_companion(word: list[int], tap: int) -> list[int]:
-        feedback = circuit.emit(word[tap - 1], word[k - 1])
-        return [feedback, *word[:-1]]
+T6_K8_REWRITE_SLOT_EXPONENTS = (1, -2, 1, -1, -1, 1, -2)
 
-    def multiply_companion_inverse(word: list[int], tap: int) -> list[int]:
-        feedback = circuit.emit(word[0], word[tap])
-        return [*word[1:], feedback]
 
-    def multiply_once(word: list[int], inverse: bool) -> list[int]:
-        if k == 16:
-            return multiply_l16_inverse(word) if inverse else multiply_l16(word)
-        tap = taps[k]
-        return multiply_companion_inverse(word, tap) if inverse else multiply_companion(word, tap)
+T7_K8_BASE_CONSTRAINTS = [
+    ("w1",  (("x2", 0),   ("x4", 0))),
+    ("w2",  (("x6", 0),   ("x7", 0))),
+    ("w3",  (("w2", -4),  ("x5", 0))),
+    ("w4",  (("x2", 0),   ("w3", 0))),
+    ("w5",  (("x3", 0),   ("w4", -1))),
+    ("w6",  (("x1", 0),   ("w5", -1))),
+    ("w7",  (("x4", 0),   ("w6", -2))),
+    ("w8",  (("w6", 0),   ("x7", 0))),
+    ("w9",  (("w1", 0),   ("w8", 0))),
+    ("w10", (("w9", 5),   ("w4", 1))),
+    ("w11", (("w7", 0),   ("w10", 0))),
+    ("y1",  (("w10", 0),  ("w5", 0))),
+    ("y2",  (("w11", 0),  ("w2", 0))),
+    ("w12", (("y2", 0),   ("x3", 0))),
+    ("w13", (("w12", 0),  ("w1", 0))),
+    ("y3",  (("w7", -4),  ("w12", 0))),
+    ("w14", (("w13", -1), ("x5", 0))),
+    ("y4",  (("w10", 1),  ("w13", 0))),
+    ("y5",  (("w11", 2),  ("w14", -1))),
+    ("y6",  (("w14", 0),  ("w8", 0))),
+    ("y7",  (("y5", 0),   ("w9", 0))),
+]
 
-    def linear(exponent: int, word: list[int]) -> list[int]:
-        result = word[:]
-        inverse = exponent < 0
-        for _ in range(abs(exponent)):
-            result = multiply_once(result, inverse)
-        return result
+T7_K8_BASELINE_EXPONENTS = (-4, -1, -1, -2, 5, 1, -4, -1, 1, 2, -1)
 
-    for destination, ((left_name, left_exp), (right_name, right_exp)) in constraints:
-        left = linear(left_exp, words[left_name])
-        right = linear(right_exp, words[right_name])
-        words[destination] = circuit.word_xor(left, right)
+T7_LARGE_BASE_CONSTRAINTS = [
+    ("w1",  (("x2", 0),   ("x4", 0))),
+    ("w2",  (("x2", 0),   ("x6", -1))),
+    ("w3",  (("x5", 0),   ("x7", 0))),
+    ("w4",  (("w3", -1),  ("w2", 0))),
+    ("w5",  (("x3", 0),   ("w4", -1))),
+    ("w6",  (("x1", 0),   ("w5", 0))),
+    ("w7",  (("x4", 0),   ("w6", -2))),
+    ("w8",  (("w6", 0),   ("x7", 0))),
+    ("w9",  (("w1", 0),   ("w8", 0))),
+    ("w10", (("w9", 2),   ("w4", 0))),
+    ("w11", (("w7", -2),  ("w10", 0))),
+    ("y1",  (("w10", 0),  ("w5", 0))),
+    ("y2",  (("w11", 0),  ("w3", 0))),
+    ("w12", (("y2", 0),   ("x3", 0))),
+    ("w13", (("w12", 0),  ("w1", -3))),
+    ("y3",  (("w7", 0),   ("w12", 1))),
+    ("w14", (("w13", 0),  ("x6", 1))),
+    ("y4",  (("w10", 0),  ("w13", -3))),
+    ("y5",  (("w11", -1), ("w14", 1))),
+    ("y6",  (("w14", 0),  ("w8", 0))),
+    ("y7",  (("y5", 0),   ("w9", 0))),
+]
 
-    total_xor = audited_total(7, k, circuit)
-    base_xor = len(constraints) * k
+T7_LARGE_BASELINE_EXPONENTS = (-1, -1, -1, -2, 2, -2, -3, 1, 1, -3, -1, 1)
+T7_LARGE_FINAL_EXPONENTS = (-1, -1, -1, -2, 2, -2, -2, 1, 1, -3, 0, 1)
 
-    if k == 16:
-        l_rows = rows(
-            (13, 16), (1,), (2,), (3,), (4,), (5,), (6,), (7,),
-            (8,), (9,), (10,), (9, 11), (12,), (13,), (14,), (15,),
+
+def signed_exponent_mod_order(exponent: int, order: int) -> int:
+    return exponent if exponent <= order // 2 else exponent - order
+
+
+def t6_slot_exponents_to_coeffs(slot_exponents: Iterable[int]) -> tuple[Coeff, ...]:
+    coeffs = [[0, 0] for _ in range(len(T6_K8_REWRITE_CONSTRAINTS))]
+    for exponent, (node_index, side) in zip(slot_exponents, T6_K8_SLOT_LAYOUT):
+        coeffs[node_index][side] = exponent
+    return tuple((left, right) for left, right in coeffs)
+
+
+def t6_transfer_blocks_from_coeffs(
+    t: int,
+    l_matrix: tuple[int, ...],
+    coeffs: tuple[Coeff, ...],
+) -> list[list[tuple[int, ...]]]:
+    k = len(l_matrix)
+    powers: dict[int, tuple[int, ...]] = {0: identity_rows(k)}
+
+    def power(exponent: int) -> tuple[int, ...]:
+        if exponent not in powers:
+            powers[exponent] = matrix_power(l_matrix, exponent)
+        return powers[exponent]
+
+    zero = tuple(0 for _ in range(k))
+    values = {
+        f"x{row + 1}": [identity_rows(k) if row == column else zero for column in range(t)]
+        for row in range(t)
+    }
+    for (destination, ((left_name, _left_old), (right_name, _right_old))), (left_exp, right_exp) in zip(
+        T6_K8_REWRITE_CONSTRAINTS, coeffs
+    ):
+        left_power = power(left_exp)
+        right_power = power(right_exp)
+        values[destination] = [
+            matrix_add(
+                matrix_multiply(left_power, values[left_name][column]),
+                matrix_multiply(right_power, values[right_name][column]),
+            )
+            for column in range(t)
+        ]
+    return [values[f"y{row + 1}"] for row in range(t)]
+
+
+def t6_transfer_blocks_from_slot_exponents(
+    l_matrix: tuple[int, ...],
+    slot_exponents: Iterable[int],
+) -> list[list[tuple[int, ...]]]:
+    return t6_transfer_blocks_from_coeffs(6, l_matrix, t6_slot_exponents_to_coeffs(slot_exponents))
+
+
+def t6_k8_search_scalar_slots(args: argparse.Namespace) -> list[Result]:
+    """Search the seven scalar slots on the fixed old t=6,k=8 map."""
+
+    started = time.time()
+    k = 8
+    l_matrix = support_rows_to_masks(T6_K8_OLD_L_ROWS)
+    costs: dict[int, int] = {0: 0}
+    print("building observed SLP cost table", flush=True)
+    for exponent_mod in range(1, 255):
+        exponent = signed_exponent_mod_order(exponent_mod, 255)
+        targets = list(matrix_power(l_matrix, exponent))
+        gates, _outputs = best_legacy_paar(
+            tuple(targets),
+            seeds=args.paar_seeds,
+            seed_base=args.seed,
         )
-    else:
-        l_rows = companion_rows(k, (taps[k], k))
+        costs[exponent_mod] = len(gates)
 
-    return Result(
-        t=7,
-        k=k,
-        graph_index=1,
-        previous_total=AUDIT_PREVIOUS_TOTALS[(7, k)],
-        total_xor=total_xor,
-        base_xor=base_xor,
-        coeffs=T7_REWRITE_COEFFS,
-        l_rows=l_rows,
-        method="exact sparse-L circuit generation from the post-optimization experiment",
+    max_power_cost = args.max_power_cost if args.max_power_cost is not None else args.scalar_budget
+    domain = [
+        exponent_mod
+        for exponent_mod, cost in costs.items()
+        if cost <= max_power_cost and cost <= args.scalar_budget
+    ]
+    domain.sort(key=lambda exponent_mod: (
+        costs[exponent_mod],
+        min(exponent_mod, 255 - exponent_mod),
+        exponent_mod,
+    ))
+    print(
+        "cost table",
+        {cost: sum(1 for value in costs.values() if value == cost) for cost in sorted(set(costs.values()))},
+        "domain",
+        len(domain),
+        flush=True,
     )
 
+    tested = 0
+    best_result: Result | None = None
+    selected: list[int] = []
 
-def run_larger_k_rewrites() -> list[Result]:
-    return [
-        run_t6_large_k_rewrite(16),
-        run_t6_large_k_rewrite(32),
-        run_t6_large_k_rewrite(64),
-        run_t7_large_k_rewrite(16),
-        run_t7_large_k_rewrite(32),
-        run_t7_large_k_rewrite(64),
+    def visit(remaining: int) -> bool:
+        nonlocal tested, best_result
+        if len(selected) == len(T6_K8_SLOT_LAYOUT):
+            tested += 1
+            cost = sum(costs[exponent] for exponent in selected)
+            signed = tuple(signed_exponent_mod_order(exponent, 255) for exponent in selected)
+            packed = block_matrix_to_packed_rows(t6_transfer_blocks_from_slot_exponents(l_matrix, signed), k)
+            if full_mds_packed(packed, 6, k):
+                result = Result(
+                    t=6,
+                    k=8,
+                    graph_index=570,
+                    previous_total=AUDIT_PREVIOUS_TOTALS[(6, 8)],
+                    total_xor=16 * k + cost,
+                    base_xor=16 * k,
+                    coeffs=(
+                        T6_REWRITE_COEFFS
+                        if signed == T6_K8_REWRITE_SLOT_EXPONENTS
+                        else t6_slot_exponents_to_coeffs(signed)
+                    ),
+                    l_rows=T6_K8_OLD_L_ROWS,
+                    method=f"searched seven scalar slots, tested {tested} assignments",
+                )
+                if best_result is None or result.total < best_result.total:
+                    best_result = result
+                    print("BEST_SEARCH", result.result_line(), "elapsed", time.time() - started, flush=True)
+                if args.stop_first:
+                    return True
+            if tested % args.report == 0:
+                best = best_result.total if best_result else None
+                print("progress", tested, "best", best, "elapsed", time.time() - started, flush=True)
+            return False
+
+        for exponent in domain:
+            cost = costs[exponent]
+            if cost > remaining:
+                break
+            selected.append(exponent)
+            should_stop = visit(remaining - cost)
+            selected.pop()
+            if should_stop:
+                return True
+        return False
+
+    visit(args.scalar_budget)
+    if best_result is None:
+        print(
+            "NO_SOLUTION",
+            {"tested": tested, "budget": args.scalar_budget, "elapsed": time.time() - started},
+            flush=True,
+        )
+        return []
+    return [best_result]
+
+
+def t6_k8_search_changed_l(args: argparse.Namespace) -> list[Result]:
+    """Randomly search sparse L maps and synthesize joint/direct bit circuits."""
+
+    rng = random.Random(args.seed)
+    started = time.time()
+    seen: set[tuple[int, ...]] = set()
+    valid_charpoly = cheap_inverse = cheap_square = mds_count = structured = 0
+    best_result: Result | None = None
+
+    for trial in range(1, args.search_trials + 1):
+        generated = random_cost2_general(rng, 8)
+        if generated is None:
+            continue
+        l_matrix, generator = generated
+        if l_matrix in seen:
+            continue
+        seen.add(l_matrix)
+        if not args.allow_any_charpoly and charpoly8(l_matrix) not in T6_K8_ALLOWED_CHARPOLYS:
+            continue
+        valid_charpoly += 1
+
+        l_path = synth_at_most(l_matrix, 8, args.l_limit)
+        if l_path is None:
+            continue
+        l_inverse = matrix_inverse(l_matrix)
+        linv_path = synth_at_most(l_inverse, 8, args.inverse_limit)
+        if linv_path is None:
+            continue
+        cheap_inverse += 1
+        l_inverse_square = matrix_multiply(l_inverse, l_inverse)
+        lm2_path = synth_at_most(l_inverse_square, 8, args.square_limit)
+        if lm2_path is None:
+            continue
+        cheap_square += 1
+
+        constraint_coeffs = t6_slot_exponents_to_coeffs(T6_K8_REWRITE_SLOT_EXPONENTS)
+        packed = block_matrix_to_packed_rows(t6_transfer_blocks_from_coeffs(6, l_matrix, constraint_coeffs), 8)
+        if not blocks_invertible_packed(packed, 6, 8):
+            continue
+        if not full_mds_packed(packed, 6, 8):
+            continue
+        mds_count += 1
+
+        joint_path = synth_at_most(l_matrix + l_inverse_square, 8, args.joint_limit)
+        if joint_path is None:
+            continue
+        structured += 1
+
+        targets = [l_matrix[row] | (l_inverse_square[row] << 8) for row in range(8)]
+        direct_gates, direct_outputs = best_randomized_paar(
+            16,
+            targets,
+            seeds=args.paar_seeds,
+            seed_base=args.seed * 10_000_019 + trial * 101,
+            window=args.paar_window,
+        )
+        direct_cost = len(direct_gates)
+        total = (
+            15 * 8
+            + len(l_path)
+            + len(joint_path)
+            + 2 * len(linv_path)
+            + direct_cost
+        )
+
+        if best_result is None or total < best_result.total:
+            l_rows = tuple(
+                tuple(column + 1 for column in range(8) if (row >> column) & 1)
+                for row in l_matrix
+            )
+            best_result = Result(
+                t=6,
+                k=8,
+                graph_index=570,
+                previous_total=AUDIT_PREVIOUS_TOTALS[(6, 8)],
+                total_xor=total,
+                base_xor=15 * 8,
+                coeffs=T6_REWRITE_COEFFS,
+                l_rows=l_rows,
+                method=(
+                    "searched sparse L with joint/direct SLPs "
+                    f"trial={trial}, direct={direct_cost}, generator={generator}, "
+                    f"direct_outputs={direct_outputs}"
+                ),
+            )
+            print("BEST_SEARCH", best_result.result_line(), "elapsed", time.time() - started, flush=True)
+
+        if args.stop_at is not None and best_result is not None and best_result.total <= args.stop_at:
+            break
+        if trial % args.report == 0:
+            print(
+                "progress",
+                {
+                    "trial": trial,
+                    "unique": len(seen),
+                    "valid_charpoly": valid_charpoly,
+                    "cheap_inverse": cheap_inverse,
+                    "cheap_square": cheap_square,
+                    "mds": mds_count,
+                    "structured": structured,
+                    "best": best_result.total if best_result else None,
+                    "elapsed": time.time() - started,
+                },
+                flush=True,
+            )
+
+    if best_result is None:
+        print(
+            "NO_SOLUTION",
+            {
+                "trials": args.search_trials,
+                "unique": len(seen),
+                "valid_charpoly": valid_charpoly,
+                "cheap_inverse": cheap_inverse,
+                "cheap_square": cheap_square,
+                "mds": mds_count,
+                "structured": structured,
+                "elapsed": time.time() - started,
+            },
+            flush=True,
+        )
+        return []
+    return [best_result]
+
+
+def t5_search_no_better_lift(args: argparse.Namespace) -> list[Result]:
+    """Exhaust the restricted t=5 larger-word lift checks."""
+
+    k = args.k or 8
+    if k not in (8, 16, 32, 64):
+        raise ValueError("t5 restricted search is defined for k=8,16,32,64")
+    constraints = T5_K4_8_BASE_CONSTRAINTS if k == 8 else T5_LARGE_BASE_CONSTRAINTS
+    budget = args.t5_budget if args.t5_budget is not None else (6 if k == 8 else 4)
+    slot_count = sum(1 for _destination, terms in constraints for _source, exponent in terms if exponent)
+    tap_candidates = [args.tap] if args.tap is not None else list(range(1, k))
+    exponent_tuples = list(exponent_tuples_by_weight(slot_count, budget))
+    started = time.time()
+    tested = passed_one_by_one = 0
+    best_result: Result | None = None
+
+    for tap in tap_candidates:
+        l_rows = companion_rows(k, (tap, k))
+        l_matrix = support_rows_to_masks(l_rows)
+        tap_one_by_one = tap_mds = 0
+        for exponents in exponent_tuples:
+            tested += 1
+            changed = constraints_with_slot_exponents(constraints, exponents)
+            blocks = transfer_blocks_from_constraints(5, l_matrix, changed)
+            if any(rank_binary(block) != k for block_row in blocks for block in block_row):
+                continue
+            passed_one_by_one += 1
+            tap_one_by_one += 1
+            packed = block_matrix_to_packed_rows(blocks, k)
+            if not full_mds_packed(packed, 5, k):
+                continue
+            tap_mds += 1
+            total = 12 * k + sum(abs(exponent) for exponent in exponents)
+            result = Result(
+                t=5,
+                k=k,
+                graph_index=126 if k > 8 else 246,
+                previous_total=AUDIT_PREVIOUS_TOTALS[(5, k)],
+                total_xor=total,
+                base_xor=12 * k,
+                coeffs=constraints_to_coeffs(changed),
+                l_rows=l_rows,
+                method=f"restricted t5 lift search tap={tap}, tested={tested}",
+            )
+            if best_result is None or result.total < best_result.total:
+                best_result = result
+                print("BEST_SEARCH", result.result_line(), "elapsed", time.time() - started, flush=True)
+        print("tap", tap, "one_by_one", tap_one_by_one, "MDS", tap_mds, flush=True)
+
+    if best_result is None:
+        print(
+            "NO_IMPROVEMENT_IN_RESTRICTED_FAMILY",
+            {
+                "t": 5,
+                "k": k,
+                "budget": budget,
+                "taps": len(tap_candidates),
+                "assignments_per_tap": len(exponent_tuples),
+                "tested": tested,
+                "passed_one_by_one": passed_one_by_one,
+                "elapsed": time.time() - started,
+            },
+            flush=True,
+        )
+        return []
+    return [best_result]
+
+
+def t6_large_search_sparse_l(args: argparse.Namespace) -> list[Result]:
+    """Search the sparse one-XOR companion L family for the t=6 large-word records."""
+
+    record_taps = {16: 1, 32: 21, 64: 21}
+    sizes = [args.k] if args.k else [16, 32, 64]
+    results: list[Result] = []
+    started = time.time()
+    for k in sizes:
+        if k not in (16, 32, 64):
+            raise ValueError("t6 large sparse-L search is defined for k=16,32,64")
+        if args.tap is not None:
+            tap_candidates = [args.tap]
+        elif args.record_taps:
+            tap_candidates = [record_taps[k]]
+        else:
+            tap_candidates = list(range(1, k))
+        best_result: Result | None = None
+        tested = 0
+        for tap in tap_candidates:
+            tested += 1
+            l_rows = companion_rows(k, (tap, k))
+            l_matrix = support_rows_to_masks(l_rows)
+            constraints = constraints_with_slot_exponents(
+                T6_K8_REWRITE_CONSTRAINTS,
+                T6_K8_REWRITE_SLOT_EXPONENTS,
+            )
+            if not constraints_are_mds(6, l_matrix, constraints):
+                continue
+            total = 16 * k + sum(abs(exponent) for exponent in T6_K8_REWRITE_SLOT_EXPONENTS)
+            result = Result(
+                t=6,
+                k=k,
+                graph_index=570,
+                previous_total=AUDIT_PREVIOUS_TOTALS[(6, k)],
+                total_xor=total,
+                base_xor=16 * k,
+                coeffs=T6_REWRITE_COEFFS,
+                l_rows=l_rows,
+                method=f"searched one-XOR companion L tap={tap}, tested={tested}",
+            )
+            if best_result is None or result.total < best_result.total:
+                best_result = result
+                print("BEST_SEARCH", result.result_line(), "elapsed", time.time() - started, flush=True)
+            if args.stop_first:
+                break
+        if best_result is None:
+            print("NO_SOLUTION", {"t": 6, "k": k, "tested_taps": tested}, flush=True)
+        else:
+            results.append(best_result)
+    return results
+
+
+def t7_k8_search_local_slps(args: argparse.Namespace) -> list[Result]:
+    """Re-run the t=7,k=8 scalar-slot/local-SLP search from the provenance record."""
+
+    started = time.time()
+    k = 8
+    l_rows = T6_K8_OLD_L_ROWS
+    l_matrix = support_rows_to_masks(l_rows)
+    print("building observed SLP cost table", flush=True)
+    synthesis_costs: dict[int, int] = {}
+    for exponent_mod in range(255):
+        exponent = signed_exponent_mod_order(exponent_mod, 255)
+        gates, _outputs = best_legacy_paar(
+            matrix_power(l_matrix, exponent),
+            seeds=args.paar_seeds,
+            seed_base=args.seed,
+        )
+        synthesis_costs[exponent_mod] = len(gates)
+
+    baseline_mod = tuple(exponent % 255 for exponent in T7_K8_BASELINE_EXPONENTS)
+    baseline_overhead = sum(synthesis_costs[exponent] for exponent in baseline_mod)
+    baseline_constraints = constraints_with_slot_exponents(T7_K8_BASE_CONSTRAINTS, T7_K8_BASELINE_EXPONENTS)
+    if not constraints_are_mds(7, l_matrix, baseline_constraints):
+        raise AssertionError("t7-k8 baseline is not MDS")
+
+    best_overhead = baseline_overhead
+    best_constraints = baseline_constraints
+    best_slot_exponents = T7_K8_BASELINE_EXPONENTS
+    best_kind = "same_exponents_multiplier_resynthesis"
+    print(
+        "BASELINE_SEARCH",
+        {
+            "old_record_overhead": 46,
+            "resynthesized_overhead": baseline_overhead,
+            "costs": [synthesis_costs[exponent] for exponent in baseline_mod],
+        },
+        flush=True,
+    )
+
+    tested_single = tested_pair = 0
+    for position in range(len(baseline_mod)):
+        for exponent_mod in sorted(range(255), key=lambda exponent: (synthesis_costs[exponent], exponent)):
+            candidate = list(baseline_mod)
+            candidate[position] = exponent_mod
+            overhead = sum(synthesis_costs[exponent] for exponent in candidate)
+            if overhead >= best_overhead:
+                continue
+            tested_single += 1
+            signed = tuple(signed_exponent_mod_order(exponent, 255) for exponent in candidate)
+            changed = constraints_with_slot_exponents(T7_K8_BASE_CONSTRAINTS, signed)
+            if not constraints_are_mds(7, l_matrix, changed):
+                continue
+            best_overhead = overhead
+            best_constraints = changed
+            best_slot_exponents = signed
+            best_kind = f"single_slot position={position}"
+            print("FOUND_SEARCH", best_kind, "overhead", overhead, flush=True)
+
+    domain = [
+        exponent_mod
+        for exponent_mod in range(255)
+        if synthesis_costs[exponent_mod] <= args.pair_cost_cap
     ]
+    if best_overhead == baseline_overhead:
+        for first, second in combinations(range(len(baseline_mod)), 2):
+            found = False
+            for left in domain:
+                for right in domain:
+                    candidate = list(baseline_mod)
+                    candidate[first] = left
+                    candidate[second] = right
+                    overhead = sum(synthesis_costs[exponent] for exponent in candidate)
+                    if overhead >= best_overhead:
+                        continue
+                    tested_pair += 1
+                    signed = tuple(signed_exponent_mod_order(exponent, 255) for exponent in candidate)
+                    changed = constraints_with_slot_exponents(T7_K8_BASE_CONSTRAINTS, signed)
+                    if not constraints_are_mds(7, l_matrix, changed):
+                        continue
+                    best_overhead = overhead
+                    best_constraints = changed
+                    best_slot_exponents = signed
+                    best_kind = f"two_slot positions=({first},{second})"
+                    print("FOUND_SEARCH", best_kind, "overhead", overhead, flush=True)
+                    found = True
+                    break
+                if found:
+                    break
+            if found:
+                break
+
+    result = Result(
+        t=7,
+        k=8,
+        graph_index=2,
+        previous_total=AUDIT_PREVIOUS_TOTALS[(7, 8)],
+        total_xor=21 * k + best_overhead,
+        base_xor=21 * k,
+        coeffs=(
+            T7_K8_RESULT_COEFFS
+            if best_slot_exponents == T7_K8_BASELINE_EXPONENTS
+            else constraints_to_coeffs(best_constraints)
+        ),
+        l_rows=l_rows,
+        method=(
+            f"searched local SLP costs and scalar slots; kind={best_kind}, "
+            f"single={tested_single}, pair={tested_pair}"
+        ),
+    )
+    print("BEST_SEARCH", result.result_line(), "elapsed", time.time() - started, flush=True)
+    return [result]
+
+
+def t7_large_search_exponents(args: argparse.Namespace) -> list[Result]:
+    """Search the t=7,k=16 exponent normalization improvement, then lift it."""
+
+    started = time.time()
+    k = 16
+    l_rows = rows(
+        (13, 16), (1,), (2,), (3,), (4,), (5,), (6,), (7,),
+        (8,), (9,), (10,), (9, 11), (12,), (13,), (14,), (15,),
+    )
+    l_matrix = support_rows_to_masks(l_rows)
+    baseline_constraints = constraints_with_slot_exponents(
+        T7_LARGE_BASE_CONSTRAINTS,
+        T7_LARGE_BASELINE_EXPONENTS,
+    )
+    if not constraints_are_mds(7, l_matrix, baseline_constraints):
+        raise AssertionError("t7 large baseline is not MDS at k=16")
+
+    best_weight = sum(abs(exponent) for exponent in T7_LARGE_BASELINE_EXPONENTS)
+    best_exponents = T7_LARGE_BASELINE_EXPONENTS
+    tested_single = tested_pair = 0
+    single_domain = sorted(
+        range(-args.single_limit, args.single_limit + 1),
+        key=lambda exponent: (abs(exponent), exponent),
+    )
+    for position in range(len(best_exponents)):
+        for exponent in single_domain:
+            candidate = list(T7_LARGE_BASELINE_EXPONENTS)
+            candidate[position] = exponent
+            weight = sum(abs(value) for value in candidate)
+            if weight >= best_weight:
+                continue
+            tested_single += 1
+            changed = constraints_with_slot_exponents(T7_LARGE_BASE_CONSTRAINTS, candidate)
+            if not constraints_are_mds(7, l_matrix, changed):
+                continue
+            best_weight = weight
+            best_exponents = tuple(candidate)
+            print("BEST_WEIGHT", best_weight, "kind", "single", "position", position, flush=True)
+
+    if best_weight == sum(abs(exponent) for exponent in T7_LARGE_BASELINE_EXPONENTS):
+        pair_domain = range(-args.pair_limit, args.pair_limit + 1)
+        for first, second in combinations(range(len(T7_LARGE_BASELINE_EXPONENTS)), 2):
+            found = False
+            for left in pair_domain:
+                for right in pair_domain:
+                    candidate = list(T7_LARGE_BASELINE_EXPONENTS)
+                    candidate[first] = left
+                    candidate[second] = right
+                    weight = sum(abs(value) for value in candidate)
+                    if weight >= best_weight:
+                        continue
+                    tested_pair += 1
+                    changed = constraints_with_slot_exponents(T7_LARGE_BASE_CONSTRAINTS, candidate)
+                    if not constraints_are_mds(7, l_matrix, changed):
+                        continue
+                    best_weight = weight
+                    best_exponents = tuple(candidate)
+                    print("BEST_WEIGHT", best_weight, "kind", "pair", "positions", (first, second), flush=True)
+                    found = True
+                    break
+                if found:
+                    break
+            if found:
+                break
+
+    results = []
+    for target_k in ([args.k] if args.k else [16, 32, 64]):
+        if target_k == 16:
+            target_rows = l_rows
+            unit_cost = 2
+        elif target_k in (32, 64):
+            target_rows = companion_rows(target_k, (21, target_k))
+            unit_cost = 1
+        else:
+            raise ValueError("t7 large exponent search reports k=16,32,64")
+        target_constraints = constraints_with_slot_exponents(T7_LARGE_BASE_CONSTRAINTS, best_exponents)
+        target_l = support_rows_to_masks(target_rows)
+        if not constraints_are_mds(7, target_l, target_constraints):
+            raise AssertionError(f"best t7 exponents do not lift to k={target_k}")
+        result = Result(
+            t=7,
+            k=target_k,
+            graph_index=1,
+            previous_total=AUDIT_PREVIOUS_TOTALS[(7, target_k)],
+            total_xor=21 * target_k + unit_cost * best_weight,
+            base_xor=21 * target_k,
+            coeffs=(
+                T7_REWRITE_COEFFS
+                if best_exponents == T7_LARGE_FINAL_EXPONENTS
+                else constraints_to_coeffs(target_constraints)
+            ),
+            l_rows=target_rows,
+            method=(
+                f"searched k=16 exponent weight; weight={best_weight}, "
+                f"single={tested_single}, pair={tested_pair}"
+            ),
+        )
+        print("BEST_SEARCH", result.result_line(), "elapsed", time.time() - started, flush=True)
+        results.append(result)
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Search bundles.
+# ---------------------------------------------------------------------------
+
+
+def copied_args(args: argparse.Namespace, **updates) -> argparse.Namespace:
+    values = vars(args).copy()
+    values.update(updates)
+    return argparse.Namespace(**values)
+
+
+def t6_k8_search(args: argparse.Namespace) -> list[Result]:
+    """Run the full two-part t=6,k=8 search used for the recorded record."""
+
+    print("== search: (6,8) fixed-L scalar reassignment ==", flush=True)
+    scalar_results = t6_k8_search_scalar_slots(
+        copied_args(
+            args,
+            scalar_budget=18,
+            max_power_cost=None,
+            paar_seeds=100,
+            seed=0,
+            stop_first=False,
+        )
+    )
+
+    print("== search: (6,8) changed sparse L and direct w10 synthesis ==", flush=True)
+    changed_l_results = t6_k8_search_changed_l(
+        copied_args(
+            args,
+            search_trials=1_000_000,
+            seed=7781,
+            paar_seeds=20,
+            stop_at=144,
+        )
+    )
+
+    return changed_l_results or scalar_results
+
+
+def run_record_searches(args: argparse.Namespace) -> list[Result]:
+    """Run the search families that produced the recorded post-optimization rows."""
+
+    results: list[Result] = []
+
+    print("== record search: (5,4) graph/coefficient enumeration ==", flush=True)
+    results.append(run_t5_k4_search(args.graph_root, max_cost=6, fixed_graph=args.fixed_graph))
+
+    for k, budget in ((8, 6), (16, 4), (32, 4), (64, 4)):
+        print(f"== restricted t=5 no-improvement check: (5,{k}) ==", flush=True)
+        t5_search_no_better_lift(copied_args(args, k=k, t5_budget=budget, tap=None))
+
+    results.extend(t6_k8_search(args))
+
+    print("== record search: (6,16),(6,32),(6,64) sparse-L family ==", flush=True)
+    results.extend(t6_large_search_sparse_l(copied_args(args, k=None, tap=None)))
+
+    print("== record search: (7,8) local coefficient-map synthesis ==", flush=True)
+    results.extend(
+        t7_k8_search_local_slps(
+            copied_args(args, paar_seeds=100, pair_cost_cap=4, seed=0)
+        )
+    )
+
+    print("== record search: (7,16),(7,32),(7,64) exponent reassignment ==", flush=True)
+    results.extend(
+        t7_large_search_exponents(
+            copied_args(args, k=None, single_limit=9, pair_limit=3)
+        )
+    )
+
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -890,23 +1663,57 @@ def print_table(results: list[Result]) -> None:
 
 def run_selected(args: argparse.Namespace) -> list[Result]:
     graph_root = args.graph_root
-    if args.run == "t5-k4":
-        return [run_t5_k4_search(graph_root, max_cost=args.max_cost, fixed_graph=args.fixed_graph)]
-    if args.run == "t7-k8":
-        return [run_t7_k8_lm4_synthesis()]
-    if args.run == "t6-k8":
-        return [run_t6_k8_direct_rewrite()]
-    if args.run == "larger-k":
-        return run_larger_k_rewrites()
-    if args.run == "all":
-        return [
-            run_t5_k4_search(graph_root, max_cost=args.max_cost, fixed_graph=args.fixed_graph),
-            run_t6_k8_direct_rewrite(),
-            *run_larger_k_rewrites()[:3],
-            run_t7_k8_lm4_synthesis(),
-            *run_larger_k_rewrites()[3:],
-        ]
-    raise ValueError(args.run)
+    if args.all_records:
+        return run_record_searches(args)
+
+    if args.t == 5 and args.k == 4:
+        return [run_t5_k4_search(graph_root, max_cost=6, fixed_graph=args.fixed_graph)]
+    if args.t == 5 and args.k in (8, 16, 32, 64):
+        return t5_search_no_better_lift(args)
+    if args.t == 6 and args.k == 8:
+        return t6_k8_search(args)
+    if args.t == 6 and args.k in (16, 32, 64):
+        return t6_large_search_sparse_l(args)
+    if args.t == 7 and args.k == 8:
+        return t7_k8_search_local_slps(
+            copied_args(args, paar_seeds=100, pair_cost_cap=4, seed=0)
+        )
+    if args.t == 7 and args.k in (16, 32, 64):
+        return t7_large_search_exponents(copied_args(args, single_limit=9, pair_limit=3))
+
+    raise ValueError("supported cases are t=5,k=4/8/16/32/64; t=6,k=8/16/32/64; t=7,k=8/16/32/64")
+
+
+def add_internal_defaults(args: argparse.Namespace) -> argparse.Namespace:
+    """Attach fixed record-search parameters without exposing them as CLI knobs."""
+
+    defaults = {
+        "graph_root": Path(__file__).resolve().parents[1] / "graph_data",
+        "seed": 0,
+        "search_trials": 100_000,
+        "scalar_budget": 18,
+        "max_power_cost": None,
+        "l_limit": 2,
+        "inverse_limit": 2,
+        "square_limit": 4,
+        "joint_limit": 5,
+        "paar_seeds": 20,
+        "paar_window": 4,
+        "report": 10_000,
+        "stop_first": False,
+        "stop_at": None,
+        "allow_any_charpoly": False,
+        "tap": None,
+        "record_taps": True,
+        "t5_budget": None,
+        "single_limit": 9,
+        "pair_limit": 3,
+        "pair_cost_cap": 4,
+    }
+    for key, value in defaults.items():
+        if not hasattr(args, key):
+            setattr(args, key, value)
+    return args
 
 
 def main() -> int:
@@ -914,30 +1721,35 @@ def main() -> int:
         description="Run bit-level XOR post-optimization experiments."
     )
     parser.add_argument(
-        "--run",
-        choices=("t5-k4", "t6-k8", "t7-k8", "larger-k", "all"),
-        required=True,
-        help="run the selected optimization experiment",
+        "--all-records",
+        action="store_true",
+        help="run the post-optimization search bundle used for the recorded results",
     )
     parser.add_argument(
-        "--graph-root",
-        type=Path,
-        default=Path(__file__).resolve().parents[1] / "graph_data",
-        help="path to the repository graph_data directory",
-    )
-    parser.add_argument(
-        "--max-cost",
+        "--t",
         type=int,
-        default=6,
-        help="maximum coefficient-map cost for the t5-k4 graph search",
+        default=None,
+        help="target matrix size for a single post-optimization search",
     )
     parser.add_argument(
         "--fixed-graph",
         type=int,
         default=None,
-        help="restrict the t5-k4 search to one graph index; omit for the full graph sweep",
+        help="restrict the t=5,k=4 search to one graph index; omit for the full graph sweep",
+    )
+    parser.add_argument(
+        "--k",
+        type=int,
+        default=None,
+        help="target word size for a single post-optimization search",
     )
     args = parser.parse_args()
+    if args.all_records:
+        if args.t is not None or args.k is not None:
+            parser.error("--all-records cannot be combined with --t or --k")
+    elif args.t is None or args.k is None:
+        parser.error("provide either --all-records or both --t and --k")
+    args = add_internal_defaults(args)
 
     results = run_selected(args)
     assert_improvements(results)

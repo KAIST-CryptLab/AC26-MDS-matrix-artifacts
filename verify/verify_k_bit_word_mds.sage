@@ -16,8 +16,28 @@ def special_8_rows():
     return [[8], [1, 2], [2, 8]] + [[i] for i in range(3, 8)]
 
 
+def t6_k8_post_rows():
+    return [[3], [6], [5], [4, 5], [4, 7], [1], [8], [2]]
+
+
 def rows_t7_k16():
     return [[13, 16]] + [[i] for i in range(1, 11)] + [[9, 11]] + [[i] for i in range(12, 16)]
+
+
+C5_4_POST = [
+    ("w1",  [term("x2"),      term("x5")]),
+    ("w2",  [term("x4"),      term("w1")]),
+    ("w3",  [term("x3"),      term("w2", -3)]),
+    ("w4",  [term("x1"),      term("w3")]),
+    ("w5",  [term("x5"),      term("w3")]),
+    ("y4",  [term("x4"),      term("w4", 1)]),
+    ("w6",  [term("w5", -1),  term("y4")]),
+    ("w7",  [term("x3"),      term("w6")]),
+    ("y1",  [term("w2"),      term("w6")]),
+    ("y2",  [term("w4"),      term("w7")]),
+    ("y5",  [term("w1"),      term("w7", -1)]),
+    ("y3",  [term("w5"),      term("y5")]),
+]
 
 
 C5_4_8 = [
@@ -56,12 +76,12 @@ C6_8_32_64 = [
     ("w1",  [term("x1"),      term("x4")]),
     ("w2",  [term("x2"),      term("x6")]),
     ("w3",  [term("x5"),      term("w2")]),
-    ("w4",  [term("w1"),      term("w3", 2)]),
+    ("w4",  [term("w1"),      term("w3", 1)]),
     ("w5",  [term("x6"),      term("w4")]),
     ("w6",  [term("x3"),      term("w5")]),
-    ("w7",  [term("x4"),      term("w6", -1)]),
+    ("w7",  [term("x4"),      term("w6", -2)]),
     ("y5",  [term("w3"),      term("w6", 1)]),
-    ("w8",  [term("x5"),      term("w7", -2)]),
+    ("w8",  [term("x5"),      term("w7", -1)]),
     ("w9",  [term("x3"),      term("w8", -1)]),
     ("y1",  [term("w4"),      term("w8")]),
     ("w10", [term("w1", 1),   term("w9", -2)]),
@@ -69,26 +89,6 @@ C6_8_32_64 = [
     ("y3",  [term("w7"),      term("w10")]),
     ("y6",  [term("w2"),      term("w10")]),
     ("y4",  [term("w5"),      term("y6")]),
-]
-
-
-C6_16 = [
-    ("w1",  [term("x2"),      term("x6")]),
-    ("w2",  [term("x5"),      term("w1")]),
-    ("w3",  [term("x1"),      term("w2", 1)]),
-    ("w4",  [term("x4"),      term("w2", 1)]),
-    ("w5",  [term("x3"),      term("w4")]),
-    ("w6",  [term("w3", 1),   term("w5")]),
-    ("w7",  [term("x5", -1),  term("w6", 1)]),
-    ("w8",  [term("x6"),      term("w7")]),
-    ("y1",  [term("w4"),      term("w7")]),
-    ("w9",  [term("x3"),      term("w8", 1)]),
-    ("y2",  [term("x4"),      term("w9")]),
-    ("y5",  [term("w3"),      term("w9", 2)]),
-    ("w10", [term("w1", -1),  term("y5")]),
-    ("y3",  [term("w8"),      term("w10")]),
-    ("y6",  [term("w5", 2),   term("w10")]),
-    ("y4",  [term("w6"),      term("y6")]),
 ]
 
 
@@ -132,13 +132,22 @@ C7_16_32_64 = [
     ("y1",  [term("w10"),     term("w5")]),
     ("y2",  [term("w11"),     term("w3")]),
     ("w12", [term("y2"),      term("x3")]),
-    ("w13", [term("w12"),     term("w1", -3)]),
+    ("w13", [term("w12"),     term("w1", -2)]),
     ("y3",  [term("w7"),      term("w12", 1)]),
     ("w14", [term("w13"),     term("x6", 1)]),
     ("y4",  [term("w10"),     term("w13", -3)]),
-    ("y5",  [term("w11", -1), term("w14", 1)]),
+    ("y5",  [term("w11"),     term("w14", 1)]),
     ("y6",  [term("w14"),     term("w8")]),
     ("y7",  [term("y5"),      term("w9")]),
+]
+
+
+T5_MATRIX_POST = [
+    [[1], [-4, -2, 0], [-1, 1], [-4, -2], [-4, -2, -1, 0]],
+    [[0, 1], [-4, -3, -2], [-1, 1], [-4, -3, -2, 0], [-4, -3, -2, -1]],
+    [[0], [-5, 0], [-2, -1], [-5, -1], [-5, -2]],
+    [[1], [-2], [1], [-2, 0], [-2]],
+    [[0], [-5, -3, 0], [-2, -1, 0], [-5, -3, -1], [-5, -3, -2, 0]],
 ]
 
 
@@ -161,19 +170,19 @@ T5_MATRIX_B = [
 
 
 CASES = [
-    {"key": (5, 4),  "L": [[4], [1, 4], [2], [3]],                 "constraints": C5_4_8,       "expected_total": 55,   "expected_matrix": T5_MATRIX_A},
+    {"key": (5, 4),  "L": [[4], [1, 4], [2], [3]],                 "constraints": C5_4_POST,    "expected_total": 54,   "expected_matrix": T5_MATRIX_POST},
     {"key": (5, 8),  "L": shift_rows(8, [6, 8]),                   "constraints": C5_4_8,       "expected_total": 103,  "expected_matrix": T5_MATRIX_A},
     {"key": (5, 16), "L": shift_rows(16, [1, 16]),                 "constraints": C5_16_32_64,  "expected_total": 197,  "expected_matrix": T5_MATRIX_B},
     {"key": (5, 32), "L": shift_rows(32, [11, 32]),                "constraints": C5_16_32_64,  "expected_total": 389,  "expected_matrix": T5_MATRIX_B},
     {"key": (5, 64), "L": shift_rows(64, [21, 64]),                "constraints": C5_16_32_64,  "expected_total": 773,  "expected_matrix": T5_MATRIX_B},
-    {"key": (6, 8),  "L": special_8_rows(),                        "constraints": C6_8_32_64,   "expected_total": 148},
-    {"key": (6, 16), "L": shift_rows(16, [15, 16]),                "constraints": C6_16,        "expected_total": 267},
-    {"key": (6, 32), "L": shift_rows(32, [21, 32]),                "constraints": C6_8_32_64,   "expected_total": 522},
-    {"key": (6, 64), "L": shift_rows(64, [21, 64]),                "constraints": C6_8_32_64,   "expected_total": 1034},
-    {"key": (7, 8),  "L": special_8_rows(),                        "constraints": C7_8,         "expected_total": 214},
-    {"key": (7, 16), "L": rows_t7_k16(),                           "constraints": C7_16_32_64,  "expected_total": 374},
-    {"key": (7, 32), "L": shift_rows(32, [21, 32]),                "constraints": C7_16_32_64,  "expected_total": 691},
-    {"key": (7, 64), "L": shift_rows(64, [21, 64]),                "constraints": C7_16_32_64,  "expected_total": 1363},
+    {"key": (6, 8),  "L": t6_k8_post_rows(),                       "constraints": C6_8_32_64,   "expected_total": 144,  "cost_model": "t6_k8_bit_post"},
+    {"key": (6, 16), "L": shift_rows(16, [1, 16]),                 "constraints": C6_8_32_64,   "expected_total": 265},
+    {"key": (6, 32), "L": shift_rows(32, [21, 32]),                "constraints": C6_8_32_64,   "expected_total": 521},
+    {"key": (6, 64), "L": shift_rows(64, [21, 64]),                "constraints": C6_8_32_64,   "expected_total": 1033},
+    {"key": (7, 8),  "L": special_8_rows(),                        "constraints": C7_8,         "expected_total": 212,  "cost_model": "t7_k8_local_slp"},
+    {"key": (7, 16), "L": rows_t7_k16(),                           "constraints": C7_16_32_64,  "expected_total": 370},
+    {"key": (7, 32), "L": shift_rows(32, [21, 32]),                "constraints": C7_16_32_64,  "expected_total": 689},
+    {"key": (7, 64), "L": shift_rows(64, [21, 64]),                "constraints": C7_16_32_64,  "expected_total": 1361},
 ]
 
 
@@ -370,6 +379,54 @@ def extra_cost(constraints, ring):
     return total
 
 
+T7_K8_LOCAL_SLP_COSTS = {
+    -4: 7,
+    -2: 4,
+    -1: 2,
+    1: 2,
+    2: 4,
+    5: 10,
+}
+
+T6_K8_PATH_L = ((64, 8, 72), (8, 16, 24))
+T6_K8_PATH_L_INV = ((4, 8, 12), (12, 16, 28))
+T6_K8_PATH_JOINT = ((1, 8, 9), (64, 8, 72), (4, 9, 13), (8, 16, 24), (4, 24, 28))
+T6_K8_DIRECT_W10_GATES = (
+    (10, 11), (3, 8), (17, 6), (14, 5), (4, 13), (15, 0), (11, 7),
+    (22, 8), (4, 17), (24, 16), (2, 9), (16, 1), (27, 12),
+)
+
+
+def cost_for_case(case, ring):
+    constraints = case["constraints"]
+    model = case.get("cost_model", "repeated_power")
+    k = ring.k
+    if model == "repeated_power":
+        base = len(constraints) * k
+        return base, extra_cost(constraints, ring), model
+    if model == "t7_k8_local_slp":
+        base = len(constraints) * k
+        extra = 0
+        for _dst, terms in constraints:
+            for _src, exp in terms:
+                exp = int(exp)
+                if exp != 0:
+                    extra += T7_K8_LOCAL_SLP_COSTS[exp]
+        return base, extra, model
+    if model == "t6_k8_bit_post":
+        # The w10 node is implemented as a direct bit-level linear circuit, so
+        # it no longer contributes the ordinary k-bit word XOR counted below.
+        base = (len(constraints) - 1) * k
+        extra = (
+            len(T6_K8_PATH_L)
+            + len(T6_K8_PATH_JOINT)
+            + 2 * len(T6_K8_PATH_L_INV)
+            + len(T6_K8_DIRECT_W10_GATES)
+        )
+        return base, extra, model
+    raise ValueError("unknown cost model: {}".format(model))
+
+
 def normalize_expected_symbolic(raw):
     return [[set(entry) for entry in row] for row in raw]
 
@@ -381,15 +438,14 @@ def main():
         ring = PowerRing(k, case["L"])
         matrix = transfer_matrix(t, case["constraints"], ring)
         singular = first_singular_minor(matrix, k)
-        base = len(case["constraints"]) * k
-        extra = extra_cost(case["constraints"], ring)
+        base, extra, cost_model = cost_for_case(case, ring)
         total = base + extra
         cost_ok = (total == case["expected_total"])
         matrix_ok = "omitted"
         if "expected_matrix" in case:
             matrix_ok = (symbolic_matrix(t, case["constraints"]) == normalize_expected_symbolic(case["expected_matrix"]))
         ok = singular is None and cost_ok and matrix_ok is not False
-        print("{} t={} k={} mds={} cost={}({}+{}) expected={} matrix_match={}".format(
+        print("{} t={} k={} mds={} cost={}({}+{}) expected={} model={} matrix_match={}".format(
             "ok" if ok else "FAIL",
             t,
             k,
@@ -398,6 +454,7 @@ def main():
             base,
             extra,
             case["expected_total"],
+            cost_model,
             matrix_ok,
         ))
         if singular is not None:

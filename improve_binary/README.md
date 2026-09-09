@@ -33,32 +33,77 @@ in `improve_binary_result.txt`, i.e. the entries above the line
 minimum XOR count for each `(t,k)`.
 
 The bit-level XOR post-optimization experiments are implemented in
-`xor_post_optimization.py`: the `(5,4)` coefficient search over
-`SC(5,5,12)`, the `(6,8)` exact joint/direct bit-level rewrite, the `(7,8)`
-exact local SLPs for the coefficient maps, and the larger-word sparse-`L`
-circuit generation.  The starting candidates are the relevant entries from
-`improve_binary_result.txt` and are written directly in the script.  The
-`(6,8)` mode also reconstructs the recorded `148 -> 147 -> 146 -> 145 -> 144`
-cost reduction before printing the final count.  The
-`(5,4)` search may take a long time when the full graph space is enabled.
+`xor_post_optimization.py`.
 
-This script can also be read as a reproducible reference for the
-post-optimization step.  Given an already MDS-valid word-level construction,
-the same ideas can be reused by replacing the hard-coded constraints,
-coefficients, and sparse linear map with another candidate, then searching for
-cheaper local SLPs or direct bit-level rewrites.
+These modes rerun the optimization without assuming the final answer.  They
+enumerate or sample coefficient assignments and sparse linear maps, synthesize
+local/joint/direct bit-level XOR circuits, test the MDS condition, and print a
+`BEST_SEARCH` line whenever a new best candidate is found.  A long randomized
+run can therefore find a candidate different from, or better than, the current
+record.
 
-For example:
+To rerun the post-optimization search bundle with the parameters used for the
+recorded results:
 
 ```sh
-python3 xor_post_optimization.py --run t5-k4 --fixed-graph 220
-python3 xor_post_optimization.py --run t6-k8
-python3 xor_post_optimization.py --run t7-k8
-python3 xor_post_optimization.py --run larger-k
+python3 xor_post_optimization.py --all-records
 ```
 
-To run the full version of the `(5,4)` search over all stored graphs, omit
-`--fixed-graph`.
+This is a long-running command.  It is intended to show the search process that
+leads to the recorded results, not just to print the final rows.
+
+This runs the following search stages:
+
+- `(5,4)`: exact graph/coefficient enumeration over `graph_data/5-5-12.dat`
+  with coefficient overhead bound 6.  To target the recorded graph directly,
+  add `--fixed-graph 220`.
+
+- `(5,8)`, `(5,16)`, `(5,32)`, `(5,64)`: restricted lift checks confirming
+  that the tested family did not improve the current records.
+
+- `(6,8)`: fixed-`L` scalar reassignment with scalar budget 18 and 100
+  local Paar seeds, followed by changed sparse-`L` search using the recorded
+  randomized seed and stopping threshold.
+
+- `(6,16)`, `(6,32)`, `(6,64)`: search over the one-XOR companion `L` family
+  using the exponent tuple found for `(6,8)`.
+
+- `(7,8)`: local coefficient-map resynthesis with 100 Paar seeds and
+  pair-replacement cap 4.
+
+- `(7,16)`, `(7,32)`, `(7,64)`: exponent reassignment on the `k=16` instance
+  with single-slot range 9 and two-slot range 3, then lifting the result to
+  the larger word sizes.
+
+These numerical parameters are fixed inside the script because they are part
+of the recorded experiment.
+
+Individual searches are selected by the matrix size `--t` and word size `--k`:
+
+```sh
+python3 xor_post_optimization.py --t 5 --k 4 --fixed-graph 220
+python3 xor_post_optimization.py --t 6 --k 8
+python3 xor_post_optimization.py --t 6 --k 32
+python3 xor_post_optimization.py --t 7 --k 8
+python3 xor_post_optimization.py --t 7 --k 16
+python3 xor_post_optimization.py --t 5 --k 8
+```
+
+The cases `(5,8)`, `(5,16)`, `(5,32)`, and `(5,64)` run the restricted lift
+check used to confirm that the tested family did not improve the current
+records.
+
+For example, these commands reproduce the sparse-`L` choices in the current
+records:
+
+```sh
+python3 xor_post_optimization.py --t 6 --k 16
+python3 xor_post_optimization.py --t 6 --k 32
+python3 xor_post_optimization.py --t 6 --k 64
+python3 xor_post_optimization.py --t 7 --k 16
+python3 xor_post_optimization.py --t 7 --k 32
+python3 xor_post_optimization.py --t 7 --k 64
+```
 
 The examples below assume your current directory is `improve_binary/`.
 
@@ -103,9 +148,10 @@ The examples below assume your current directory is `improve_binary/`.
 - Rerun selected bit-level XOR post-optimization experiments:
 
 ```sh
-python3 xor_post_optimization.py --run t6-k8
-python3 xor_post_optimization.py --run t7-k8
-python3 xor_post_optimization.py --run larger-k
+python3 xor_post_optimization.py --all-records
+python3 xor_post_optimization.py --t 6 --k 8
+python3 xor_post_optimization.py --t 7 --k 8
+python3 xor_post_optimization.py --t 6 --k 32
 ```
 
 - Manual stage-1 coefficients:
